@@ -284,15 +284,10 @@ func (l Location) Backup(cron bool, dry bool, specificBackend string) []error {
 					colors.Secondary.Println("Copying " + copyFrom + " → " + copyToTarget)
 					env, _ := b1.getEnv()
 					env2, _ := b2.getEnv()
-					// Add the second repo to the env with a "2" suffix
-					for k, v := range env2 {
-						env[k+"2"] = v
-					}
-					_, _, err := ExecuteResticCommand(ExecuteOptions{
-						Envs: env,
-					}, "copy", md.SnapshotID)
+					out, err := runCopyWithLockRecovery(env, env2, md.SnapshotID)
 
 					if err != nil {
+						colors.Error.Println(out)
 						errors = append(errors, err)
 					}
 				}
@@ -332,20 +327,98 @@ after:
 	return errors
 }
 
+// Restic exits with 11 when locked, and with 1 for a half-written lock file
+func isLockError(code int, output string) bool {
+	if code == 11 {
+		return true
+	}
+	output = strings.ToLower(output)
+	return strings.Contains(output, "already locked") ||
+		strings.Contains(output, "invalid lock file")
+}
+
+// A plain unlock ignores unreadable locks, so invalid ones need --remove-all
+func removeResticLock(options ExecuteOptions, failedOutput string) {
+	args := []string{"unlock"}
+	if strings.Contains(strings.ToLower(failedOutput), "invalid lock file") {
+		colors.Secondary.Println("Removing invalid restic lock(s)...")
+		args = append(args, "--remove-all")
+	} else {
+		colors.Secondary.Println("Clearing stale restic lock(s)...")
+	}
+	if _, out, err := ExecuteResticCommand(options, args...); err != nil {
+		colors.Error.Println(out)
+	}
+}
+
+// Clears a stale lock and retries once, so one crashed run cannot block all later ones
+func executeResticWithLockRecovery(options ExecuteOptions, args ...string) (string, error) {
+	code, out, err := ExecuteResticCommand(options, args...)
+	if err == nil || !isLockError(code, out) {
+		return out, err
+	}
+
+	removeResticLock(options, out)
+
+	_, out, err = ExecuteResticCommand(options, args...)
+	return out, err
+}
+
+// Clears a stale lock in either repo and retries once
+func runCopyWithLockRecovery(sourceEnv, destEnv map[string]string, snapshotID string) (string, error) {
+	env := make(map[string]string, len(sourceEnv)+len(destEnv))
+	for k, v := range sourceEnv {
+		env[k] = v
+	}
+	// Add the second repo to the env with a "2" suffix
+	for k, v := range destEnv {
+		env[k+"2"] = v
+	}
+
+	options := ExecuteOptions{Envs: env}
+	code, out, err := ExecuteResticCommand(options, "copy", snapshotID)
+	if err == nil || !isLockError(code, out) {
+		return out, err
+	}
+
+	removeResticLock(ExecuteOptions{Envs: sourceEnv}, out)
+	removeResticLock(ExecuteOptions{Envs: destEnv}, out)
+
+	_, out, err = ExecuteResticCommand(options, "copy", snapshotID)
+	return out, err
+}
+
+// Copy targets need forgetting too, or they grow forever. De-duplicated, no alias of l.To
+func (l Location) backendsToForget() []string {
+	backends := make([]string, 0, len(l.To))
+	for _, to := range l.To {
+		if !ArrayContains(backends, to) {
+			backends = append(backends, to)
+		}
+	}
+	for _, copyBackends := range l.CopyOption {
+		for _, to := range copyBackends {
+			if !ArrayContains(backends, to) {
+				backends = append(backends, to)
+			}
+		}
+	}
+	return backends
+}
+
 func (l Location) Forget(prune bool, dry bool) error {
 	colors.PrimaryPrint("Forgetting for location \"%s\"", l.name)
 
-	backendsToForget := l.To
-	for _, copyBackends := range l.CopyOption {
-		backendsToForget = append(backendsToForget, copyBackends...)
-	}
+	backendsToForget := l.backendsToForget()
 
+	var errs []error
 	for _, to := range backendsToForget {
 		backend, _ := GetBackend(to)
 		colors.Secondary.Printf("For backend \"%s\"\n", backend.name)
 		env, err := backend.getEnv()
 		if err != nil {
-			return nil
+			errs = append(errs, err)
+			continue
 		}
 		options := ExecuteOptions{
 			Envs: env,
@@ -358,10 +431,14 @@ func (l Location) Forget(prune bool, dry bool) error {
 			cmd = append(cmd, "--dry-run")
 		}
 		cmd = append(cmd, combineAllOptions("forget", l, backend)...)
-		_, _, err = ExecuteResticCommand(options, cmd...)
+		out, err := executeResticWithLockRecovery(options, cmd...)
 		if err != nil {
-			return err
+			colors.Error.Println(out)
+			errs = append(errs, fmt.Errorf("%s@%s: %w", l.name, backend.name, err))
 		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	colors.Success.Println("Done")
 	return nil

@@ -91,3 +91,56 @@ func TestBuildRestoreCommand(t *testing.T) {
 	expected := []string{"restore", "--target", "to", "--tag", "ar:location:foo", "snapshot", "options"}
 	assertSliceEqual(t, result, expected)
 }
+
+func TestIsLockError(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   int
+		output string
+		want   bool
+	}{
+		{"exit code 11", 11, "", true},
+		{"already locked", 1, "repo already locked, waiting up to 0s for the lock", true},
+		{"invalid lock", 1, "Fatal: invalid lock file: LoadRaw(<lock/ffffffffff>)", true},
+		{"unrelated error", 1, "Fatal: unable to open repository", false},
+		{"success", 0, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertEqual(t, isLockError(tt.code, tt.output), tt.want)
+		})
+	}
+}
+
+func TestBackendsToForget(t *testing.T) {
+	t.Run("copy targets are included", func(t *testing.T) {
+		l := Location{
+			To: []string{"a", "b"},
+			CopyOption: LocationCopy{
+				"a": {"c"},
+			},
+		}
+		assertSliceEqual(t, l.backendsToForget(), []string{"a", "b", "c"})
+	})
+
+	t.Run("duplicates are removed", func(t *testing.T) {
+		l := Location{
+			To: []string{"a", "a"},
+			CopyOption: LocationCopy{
+				"a": {"a", "c", "c"},
+			},
+		}
+		assertSliceEqual(t, l.backendsToForget(), []string{"a", "c"})
+	})
+
+	t.Run("does not mutate the location", func(t *testing.T) {
+		l := Location{
+			To: []string{"a"},
+			CopyOption: LocationCopy{
+				"a": {"c"},
+			},
+		}
+		l.backendsToForget()
+		assertSliceEqual(t, l.To, []string{"a"})
+	})
+}

@@ -20,19 +20,23 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/cupcakearmy/autorestic/cmd"
+	"github.com/cupcakearmy/autorestic/internal"
 	"github.com/cupcakearmy/autorestic/internal/lock"
 )
 
 func handleCtrlC() {
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-c
 		fmt.Println("Signal:", sig)
+		// Let children exit cleanly, otherwise restic leaves its lock behind
+		internal.TerminateRunningCommands(30 * time.Second)
 		lock.Unlock()
-		os.Exit(0)
+		os.Exit(1)
 	}()
 }
 

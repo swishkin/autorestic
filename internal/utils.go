@@ -6,6 +6,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/cupcakearmy/autorestic/internal/colors"
 	"github.com/cupcakearmy/autorestic/internal/flags"
@@ -39,6 +42,62 @@ func (w ColoredWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+type runningCommand struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+}
+
+var (
+	runningCommandsMutex sync.Mutex
+	runningCommands      []*runningCommand
+)
+
+func registerRunningCommand(cmd *exec.Cmd) *runningCommand {
+	running := &runningCommand{cmd: cmd, done: make(chan struct{})}
+	runningCommandsMutex.Lock()
+	runningCommands = append(runningCommands, running)
+	runningCommandsMutex.Unlock()
+	return running
+}
+
+func unregisterRunningCommand(running *runningCommand) {
+	runningCommandsMutex.Lock()
+	for i, other := range runningCommands {
+		if other == running {
+			runningCommands = append(runningCommands[:i], runningCommands[i+1:]...)
+			break
+		}
+	}
+	runningCommandsMutex.Unlock()
+	close(running.done)
+}
+
+// Forward SIGTERM so restic can drop its lock on the way out, then force kill
+func TerminateRunningCommands(timeout time.Duration) {
+	runningCommandsMutex.Lock()
+	running := make([]*runningCommand, len(runningCommands))
+	copy(running, runningCommands)
+	runningCommandsMutex.Unlock()
+
+	for _, rc := range running {
+		if rc.cmd.Process != nil {
+			_ = rc.cmd.Process.Signal(syscall.SIGTERM)
+		}
+	}
+
+	deadline := time.After(timeout)
+	for _, rc := range running {
+		select {
+		case <-rc.done:
+		case <-deadline:
+			if rc.cmd.Process != nil {
+				_ = rc.cmd.Process.Kill()
+			}
+			<-rc.done
+		}
+	}
+}
+
 func ExecuteCommand(options ExecuteOptions, args ...string) (int, string, error) {
 	cmd := exec.Command(options.Command, args...)
 	env := os.Environ()
@@ -65,7 +124,9 @@ func ExecuteCommand(options ExecuteOptions, args ...string) (int, string, error)
 		cmd.Stdout = &out
 	}
 	cmd.Stderr = &error
+	running := registerRunningCommand(cmd)
 	err := cmd.Run()
+	unregisterRunningCommand(running)
 	if err != nil {
 		code := -1
 		if exitError, ok := err.(*exec.ExitError); ok {

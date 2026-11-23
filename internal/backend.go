@@ -133,17 +133,33 @@ func (b Backend) validate() error {
 	// Check if already initialized
 	cmd := []string{"check"}
 	cmd = append(cmd, combineBackendOptions("check", b)...)
-	_, _, err = ExecuteResticCommand(options, cmd...)
+	code, out, err := ExecuteResticCommand(options, cmd...)
 	if err == nil {
 		return nil
-	} else {
-		// If not initialize
-		colors.Body.Printf("Initializing backend \"%s\"...\n", b.name)
-		cmd := []string{"init"}
-		cmd = append(cmd, combineBackendOptions("init", b)...)
-		_, _, err := ExecuteResticCommand(options, cmd...)
+	}
+	if isLockError(code, out) {
+		// Clear the stale lock and retry
+		removeResticLock(options, out)
+		code, out, err = ExecuteResticCommand(options, cmd...)
+		if err == nil {
+			return nil
+		}
+	}
+	// Restic exits with 10 if the repository does not exist. Any other failure
+	// (wrong password, unreachable backend, damaged repo) is not fixed by init.
+	if code != 10 {
+		colors.Error.Println(out)
+		return fmt.Errorf(`backend "%s" is not usable: %w`, b.name, err)
+	}
+	colors.Body.Printf("Initializing backend \"%s\"...\n", b.name)
+	cmd = []string{"init"}
+	cmd = append(cmd, combineBackendOptions("init", b)...)
+	_, out, err = ExecuteResticCommand(options, cmd...)
+	if err != nil {
+		colors.Error.Println(out)
 		return err
 	}
+	return nil
 }
 
 func (b Backend) Exec(args []string) error {
